@@ -1,6 +1,6 @@
 const puppeteer = require('puppeteer')
 const PDFMerge = require('easy-pdf-merge')
-const { join, dirname } = require('path')
+const { join } = require('path')
 const { dev } = require('vuepress')
 const { fs, logger, chalk } = require('@vuepress/shared-utils')
 const { red, yellow, gray } = chalk
@@ -8,7 +8,7 @@ const { red, yellow, gray } = chalk
 // Keep silent before running custom command.
 logger.setOptions({ logLevel: 1 })
 
-module.exports = (options = {}, context) => ({
+module.exports = (opts = {}, ctx) => ({
   name: 'vuepress-plugin-export',
 
   chainWebpack(config) {
@@ -23,106 +23,86 @@ module.exports = (options = {}, context) => ({
       .allowUnknownOptions()
       .action(async (dir = '.') => {
         dir = join(process.cwd(), dir)
+
+        // for(var key in ctx.pages) {
+        //   console.log(key, ctx.pages[key]);
+        // }
+
         try {
-          const devContext = await dev({
+          const nCtx = await dev({
             sourceDir: dir,
             clearScreen: false,
-            theme: options.theme || '@vuepress/default'
+            theme: opts.theme || '@vuepress/default'
           })
-
-          await new Promise(resolve => {
-            devContext.devProcess.server.compiler.hooks.done.tap('webpack-dev-server', () => {
-              console.log('VuePress dev server compiler done')
-              resolve()
-            })
-          })
-
           logger.setOptions({ logLevel: 3 })
           logger.info(`Start to generate current site to PDF ...`)
-
           try {
-            await generatePDF(devContext, {
-              port: devContext.devProcess.port,
-              host: devContext.devProcess.displayHost, // See vuejs/vuepress@4d5c50e
-              base: devContext.base,
-              options
-            })
+            await generatePDF(ctx, nCtx.devProcess.port, 'localhost')//nCtx.devProcess.host)
           } catch (error) {
-            logger.error(red(error))
+            console.error(red(error))
           }
-
-          devContext.devProcess.server.close()
+          nCtx.devProcess.server.close()
           process.exit(0)
-        } catch (error) {
-          throw error
+        } catch (e) {
+          throw e
         }
       })
   }
 })
 
-const defineBundles = (options, exportPages) => {
-  return (typeof options.bundles === 'function')
-    ? options.bundles(exportPages)
-    : Array.isArray(options.bundles)
-      ? options.bundles
-      : options.bundles
-        ? [options.bundles]
-        : {}
-}
-
-const applyFilter = (filter) => {
-  if (typeof filter === 'function') {
-    return (page) => filter(page.location, page)
-  }
-
-  return (page) => {
-    return !filter || filter.test(page.location)
-  }
-}
-
-const createOutputFilename = (dest, pluginConfig, fallback) => {
-  if (typeof dest === 'function') {
-    return dest(pluginConfig)
-  }
-
-  if (typeof dest === 'string') {
-    return dest
-  }
-
-  return `${pluginConfig.title || String(fallback)}.pdf`
-}
-
-async function generatePDF(context, {
-  port,
-  host,
-  base,
-  options,
-}) {
-  const { pages, tempPath, siteConfig } = context
+async function generatePDF(ctx, port, host) {
+  const { pages, tempPath, siteConfig } = ctx
   const tempDir = join(tempPath, 'pdf')
-
   fs.ensureDirSync(tempDir)
 
-  const browser = await puppeteer.launch(options.puppeteer)
-  const browserPage = await browser.newPage()
+  let exportPages = [];
+  let navList = ctx.themeConfig.nav.map(n => n.link);
+  //console.log(ctx.themeConfig.nav);
+  for(var i=0; i<navList.length; i++) {
+    const nav = navList[i];
+    if(!ctx.themeConfig.sidebar[nav] || !ctx.themeConfig.sidebar[nav][0]) {
+      continue;
+    }
+    for(var j=0; j<ctx.themeConfig.sidebar[nav][0].children.length; j++) {
+      let child = ctx.themeConfig.sidebar[nav][0].children[j];
+      //console.log('child', `"${child}"`);
+      if(child != '') {
+        child += '.html';
+      }
+      //console.log('finding', nav + child);
+      const page = pages.find(p=> {
+        return p.path == (nav + child);
+      });
+      if(!page) continue;
+      //console.log('page found', page);
+      exportPages.push({
+        url: page.path,
+        title: page.title,
+        location: `http://${host}:${port}${page.path}`,
+        path: `${tempDir}/${page.key}.pdf`
+      });
+    }
+  }
 
-  // Generate all pages on bulk
-  const exportPages = pages.slice(0).map(page => {
+  /*const exportPages = pages.map(page => {
     return {
       url: page.path,
       title: page.title,
-      location: `http://${host}:${port}${base || ''}${page.path.slice(1)}`,
+      location: `http://${host}:${port}${page.path}`,
       path: `${tempDir}/${page.key}.pdf`
     }
-  })
+  })*/
 
-  for (const exportPage of exportPages) {
+  const browser = await puppeteer.launch()
+  const browserPage = await browser.newPage()
+
+  for (let i = 0; i < exportPages.length; i++) {
     const {
       location,
       path: pagePath,
       url,
       title
-    } = exportPage
+    } = exportPages[i]
 
     await browserPage.goto(
       location,
@@ -134,42 +114,26 @@ async function generatePDF(context, {
       format: 'A4'
     })
 
-    logger.success(`Generated ${yellow(title)} ${gray(`${url}`)}`)
+    logger.success(
+      `Generated ${yellow(title)} ${gray(`${url}`)}`
+    )
   }
+
+  const files = exportPages.map(({ path }) => path)
+  const outputFilename = siteConfig.title || 'site'
+  const outputFile = `${outputFilename}.pdf`
+  await new Promise(resolve => {
+    PDFMerge(files, outputFile, err => {
+      if (err) {
+        throw err
+      }
+      logger.success(`Export ${yellow(outputFile)} file!`)
+      resolve()
+    })
+  })
 
   await browser.close()
-
-  const bundles = defineBundles(options, exportPages)
-
-  for (const bundle of bundles) {
-    const files = exportPages
-      .filter(applyFilter(bundle.filter))
-      .sort(bundle.sorter)
-      .map(({ path }) => path)
-
-    const outputFile = createOutputFilename(bundle.dest, siteConfig, 'site')
-    if (files.length === 0) {
-      logger.warn('WARN. Found no files to export!')
-    } else if (files.length === 1) {
-      const [filename] = files
-      fs.mkdirSync(dirname(outputFile), { recursive: true })
-
-      fs.copyFileSync(filename, outputFile)
-      logger.success(`Export ${yellow(outputFile)} file!`)
-    } else {
-      await new Promise(resolve => {
-        fs.mkdirSync(dirname(outputFile), { recursive: true })
-
-        PDFMerge(files, outputFile, error => {
-          if (error) {
-            throw error
-          }
-          logger.success(`Export ${yellow(outputFile)} file!`)
-          resolve()
-        })
-      })
-    }
-  }
-
-  // fs.removeSync(tempDir)
+  fs.removeSync(tempDir)
 }
+
+
